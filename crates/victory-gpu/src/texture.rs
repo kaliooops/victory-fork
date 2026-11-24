@@ -64,13 +64,23 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    /// The frame a partly mapped texture was last read in.
-    partial: Option<u64>,
+    /// When a partly mapped texture was last read.
+    partial: Option<std::time::Instant>,
     /// The guard missed a write to this texture: a hash taken while it
     /// reported none found new contents (the title writes it through
     /// another view of the same pages, as a movie decoder writing its ring
     /// of planes does). Hashed at every check from then on.
     blind: bool,
+}
+
+/// How often a partly mapped (streaming) texture is read again:
+/// `VICTORY_PARTIAL_MS`, 1000 by default (what 30 frames were at 30 fps).
+fn partial_every() -> std::time::Duration {
+    static EVERY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let ms = std::env::var("VICTORY_PARTIAL_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1000);
+        std::time::Duration::from_millis(ms)
+    })
 }
 
 /// Textures found [`Last::blind`] so far.
@@ -712,14 +722,18 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
-            let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            // shortcut: read again at most once per `partial_every()`
+            // (reading around unmapped pages is slow, and nothing tells us
+            // when pages arrive): a mip that streams in shows up to that
+            // late. It was every 30 frames: a second at the console's
+            // 30 fps, but 7.5 s at 4 fps and 30 s at 1 fps, so walls in the
+            // world sharpened over minutes. The title streams by the clock,
+            // so the wait is a time.
+            let now = std::time::Instant::now();
+            if last.partial.is_some_and(|at| now.duration_since(at) < partial_every()) {
                 return 0;
             }
-            last.partial = Some(frame);
+            last.partial = Some(now);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
