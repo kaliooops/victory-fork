@@ -7116,6 +7116,76 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[a]);
                 float(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // A double in a register pair, narrowed in 32-bit integer
+                // arithmetic: no double type (and no double-precision
+                // shader flag) needed. Round to nearest even, the MODE
+                // register's default.
+                // shortcut: results below the smallest normal f32 flush to
+                // a signed zero (as f32 denormals do in the host's default
+                // mode); a NaN becomes the quiet NaN of its sign.
+                let (lo, hi) = self.src64_dwords(inst, 0)?;
+                let sign_bit = self.s.m.i32(0x8000_0000);
+                let mut hi = hi;
+                if v.abs & 1 != 0 {
+                    let k = self.s.m.i32(0x7fff_ffff);
+                    hi = self.s.m.bin(c, Bin::And, hi, k);
+                }
+                if v.neg & 1 != 0 {
+                    hi = self.s.m.bin(c, Bin::Xor, hi, sign_bit);
+                }
+                let sign = self.s.m.bin(c, Bin::And, hi, sign_bit);
+                let k20 = self.s.m.i32(20);
+                let k7ff = self.s.m.i32(0x7ff);
+                let exp = self.s.m.bin(c, Bin::LShr, hi, k20);
+                let exp = self.s.m.bin(c, Bin::And, exp, k7ff);
+                let kfffff = self.s.m.i32(0x000f_ffff);
+                let mant_hi = self.s.m.bin(c, Bin::And, hi, kfffff);
+                // The f32 exponent, biased: 1023 - 127 = 896 apart.
+                let k896 = self.s.m.i32(896);
+                let e = self.s.m.bin(c, Bin::Sub, exp, k896);
+                // The top 23 mantissa bits, and the 29 below them.
+                let k3 = self.s.m.i32(3);
+                let k29 = self.s.m.i32(29);
+                let m23 = self.s.m.bin(c, Bin::Shl, mant_hi, k3);
+                let top = self.s.m.bin(c, Bin::LShr, lo, k29);
+                let m23 = self.s.m.bin(c, Bin::Or, m23, top);
+                let krest = self.s.m.i32(0x1fff_ffff);
+                let rest = self.s.m.bin(c, Bin::And, lo, krest);
+                let khalf = self.s.m.i32(0x1000_0000);
+                let above = self.s.m.cmp(c, pred::IUGT, rest, khalf);
+                let tie = self.s.m.cmp(c, pred::EQ, rest, khalf);
+                let one = self.s.m.i32(1);
+                let odd = self.s.m.bin(c, Bin::And, m23, one);
+                let zero = self.s.m.i32(0);
+                let odd = self.s.m.cmp(c, pred::NE, odd, zero);
+                let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+                let up = self.s.m.bin(c, Bin::Or, above, tie_up);
+                let up = self.s.m.cast(c, Cast::ZExt, up, self.s.t.i32);
+                // Exponent and mantissa added whole: a mantissa that rounds
+                // over carries into the exponent, and up to infinity.
+                let k23 = self.s.m.i32(23);
+                let ebits = self.s.m.bin(c, Bin::Shl, e, k23);
+                let normal = self.s.m.bin(c, Bin::Or, ebits, m23);
+                let normal = self.s.m.bin(c, Bin::Add, normal, up);
+                let inf = self.s.m.i32(0x7f80_0000);
+                let nan = self.s.m.i32(0x7fc0_0000);
+                // exp == 0x7ff: infinity or NaN.
+                let special = self.s.m.cmp(c, pred::EQ, exp, k7ff);
+                let mant_lo_any = self.s.m.bin(c, Bin::Or, mant_hi, lo);
+                let is_nan = self.s.m.cmp(c, pred::NE, mant_lo_any, zero);
+                let special_bits = self.s.m.select(c, is_nan, nan, inf);
+                // Too large for f32: infinity; too small: zero.
+                let k255 = self.s.m.i32(255);
+                let over = self.s.m.cmp(c, pred::SGE, e, k255);
+                let under = self.s.m.cmp(c, pred::SLE, e, zero);
+                let r = self.s.m.select(c, under, zero, normal);
+                let r = self.s.m.select(c, over, inf, r);
+                let r = self.s.m.select(c, special, special_bits, r);
+                let r = self.s.m.bin(c, Bin::Or, r, sign);
+                let r = self.as_float(r);
+                float(self, r)
+            }
             "v_cndmask_b32" => {
                 let mask = match v.src.get(2) {
                     Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
@@ -7331,6 +7401,28 @@ impl<'a> Lower<'a> {
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).
+    /// The low and high dwords of 64-bit source `k`, a VGPR or SGPR pair,
+    /// without its modifiers (the caller applies them). Constants are
+    /// refused: a 64-bit float operand reads an inline float or a literal
+    /// as a double, which `src64` does not model.
+    fn src64_dwords(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let (r, r1) = match op {
+            Operand::Vector { reg, .. } => (Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code != NULL => (Reg::S(code), Reg::S(code + 1)),
+            _ => return Err("a constant 64-bit float operand"),
+        };
+        let lo = self.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+        let hi = self.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+        Ok((lo, hi))
+    }
+
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -8544,6 +8636,24 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
+            // The first half of a pair its second half evaluates whole
+            // (`io::push_pair` lists no entry for it): its result is only
+            // the console's partial sum, which nothing but the second half
+            // reads. Except where the second half writes one 16-bit half
+            // of the same register and keeps the other: then the kept
+            // bits are what the first half left there, which no program
+            // uses for a value. They read 0 here, where they were missing
+            // and took the whole register with them (`PS_DeferredTextured`:
+            // `v_interp_p2_f16 v10, v1, attr3.w, v10 high`).
+            if matches!(inst.name(), "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16") {
+                let zero = self.s.m.i32(0);
+                for &(r, w) in &inst.writes {
+                    if matches!(r, Reg::V(_)) {
+                        self.vals.insert(w, Val::I32(zero));
+                    }
+                }
+                return Ok(());
+            }
             return Err("the first half of an interpolation");
         };
         let name = inst.name();

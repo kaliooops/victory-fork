@@ -1264,3 +1264,97 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// What `v_cvt_f32_f64` gives for `d`: round to nearest even, results below
+/// the smallest normal f32 flushed to a signed zero, NaN as the quiet NaN
+/// of its sign.
+fn cvt_f32_f64_reference(d: f64) -> u32 {
+    if d.is_nan() {
+        return 0x7fc0_0000 | (d.to_bits() >> 32) as u32 & 0x8000_0000;
+    }
+    let f = d as f32;
+    if f != 0.0 && f.abs() < f32::MIN_POSITIVE {
+        return f.to_bits() & 0x8000_0000;
+    }
+    // Rust rounds the exact value; one that rounds up to the smallest normal
+    // from below it counts as flushed in our lowering, as on hardware with
+    // denormals flushed before rounding.
+    if f.abs() == f32::MIN_POSITIVE && d.abs() < f64::from(f32::MIN_POSITIVE) {
+        return f.to_bits() & 0x8000_0000;
+    }
+    f.to_bits()
+}
+
+#[test]
+fn v_cvt_f32_f64_rounds_to_nearest_even() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 0x00F); the double's low dword in v1.
+    let shader = build_valu_cs(&[vop1(0x00F, 0, vgpr(1))]);
+    let mut doubles: Vec<f64> = vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.5,
+        0.1,
+        1.0 / 3.0,
+        std::f64::consts::PI,
+        65504.0,
+        f64::from(f32::MAX),
+        f64::from(f32::MAX) * 1.000_000_1, // rounds to f32::MAX or over
+        1e39,
+        -1e39,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        -f64::NAN,
+        f64::from(f32::MIN_POSITIVE),
+        f64::from(f32::MIN_POSITIVE) / 2.0,
+        1e-40,
+        f64::MIN_POSITIVE,
+        // Ties: exactly halfway between two f32 values, even and odd.
+        f64::from_bits(0x3FF0_0000_1000_0000), // 1 + 2^-24: tie, rounds to even (1.0)
+        f64::from_bits(0x3FF0_0000_3000_0000), // tie above an odd mantissa: up
+        f64::from_bits(0x3FF0_0000_1000_0001), // just above a tie: up
+        f64::from_bits(0x3FF0_0000_0FFF_FFFF), // just below a tie: down
+        f64::from_bits(0x47EF_FFFF_F000_0000), // the tie at f32::MAX: rounds to infinity
+    ];
+    // Pseudo-random bit patterns across the exponent range f32 covers.
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..48 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let exp = 896 + (x >> 52) % 270; // f32's range and a little past it
+        doubles.push(f64::from_bits(x & 0x800F_FFFF_FFFF_FFFF | exp << 52));
+    }
+    let inputs: Vec<[u32; 4]> = doubles
+        .iter()
+        .map(|d| [d.to_bits() as u32, (d.to_bits() >> 32) as u32, 0, 0])
+        .collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cvt_f32_f64_reference(doubles[i]);
+        assert_eq!(
+            got,
+            want,
+            "{backend}: v_cvt_f32_f64({:#018x}) = {got:#010x}, want {want:#010x}",
+            doubles[i].to_bits(),
+        );
+    });
+
+    // VOP3 with |src| and -src (0x180 + 0x00F).
+    let modified = [(1u8, 0u8, "abs"), (0, 1, "neg"), (1, 1, "-abs")];
+    for (abs, neg, what) in modified {
+        let shader = build_valu_cs(&vop3_mod(0x18F, 0, vgpr(1), 0, 0, abs, neg, 0, false));
+        let d = -2.5f64;
+        let input = [d.to_bits() as u32, (d.to_bits() >> 32) as u32, 0, 0];
+        let mut e = d;
+        if abs != 0 {
+            e = e.abs();
+        }
+        if neg != 0 {
+            e = -e;
+        }
+        run_cases(&shader, &[input], |backend, _, _, got| {
+            assert_eq!(got, (e as f32).to_bits(), "{backend}: v_cvt_f32_f64 {what}(-2.5)");
+        });
+    }
+}
