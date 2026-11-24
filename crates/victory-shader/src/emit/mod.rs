@@ -461,6 +461,30 @@ pub fn emit(
                 }
             }
         }
+        // Last of all, with `VICTORY_WAVE_WIDE` unset: the wave-wide branches after all, for a
+        // program every other form left at 64 lanes. Such a program is refused by a host of
+        // 32-lane waves (its pipeline fails, E_INVALIDARG on an RTX 5070), so it never runs
+        // either way; the programs whose wave-wide form lost the card in runs 121-124
+        // (`ptfx_CS_lightAtlas_Sprite`, `_Trail`) are taken by an earlier form and never get
+        // here. On an RTX 5070 this brings `CS_Tiling_Generate_Opaque` and `CS_Visibility`
+        // to 32 lanes. `VICTORY_WAVE_WIDE=0` leaves it out.
+        if !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
