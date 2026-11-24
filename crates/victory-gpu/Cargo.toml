@@ -19,6 +19,10 @@ victory-shader.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[build-dependencies]
+# The translator's fingerprint for the shader cache (build.rs).
+blake3.workspace = true
+
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []

@@ -66,6 +66,29 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The guard missed a write to this texture: a hash taken while it
+    /// reported none found new contents (the title writes it through
+    /// another view of the same pages, as a movie decoder writing its ring
+    /// of planes does). Hashed at every check from then on.
+    blind: bool,
+}
+
+/// Textures found [`Last::blind`] so far.
+static BLIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A hash taken although the guard reported no write found `changed`
+/// contents: the guard cannot see this texture's writes.
+fn note_blind(last: &mut Last, checking: bool, changed: bool, start: usize, size: usize) {
+    if checking && changed && !last.blind {
+        last.blind = true;
+        let n = BLIND.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::info!(
+            address = format_args!("{start:#x}"),
+            kib = size >> 10,
+            textures = n,
+            "a texture changed where the guard saw no write: hashed at every check from now on"
+        );
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -646,7 +669,15 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        //
+        // A texture whose hash once found a change the guard had not seen
+        // is hashed at every check (`Last::blind`): the opening movie's
+        // planes, written through another view, were otherwise brought up
+        // to date every eighth frame only, and the movie showed its ring of
+        // three frames over and over. `checking` marks a hash taken while
+        // the guard reported no write.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut checking = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -654,9 +685,10 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if unwritten && !turn && !last.blind {
                 return 0;
             }
+            checking = unwritten;
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -718,6 +750,7 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return size;
                 }
+                note_blind(last, checking, last.hash.is_some(), start, size);
                 last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -734,6 +767,7 @@ impl Staging {
         if last.hash == Some(hash) {
             return size;
         }
+        note_blind(last, checking, last.hash.is_some(), start, size);
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
