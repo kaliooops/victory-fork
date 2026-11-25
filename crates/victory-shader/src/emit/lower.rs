@@ -3612,6 +3612,32 @@ impl<'a> Lower<'a> {
         v
     }
 
+    /// Every host wave publishes its vote. Unlike `exchange_halves`, this
+    /// steers control flow containing group barriers, so every console wave
+    /// in the group must take the same path. Payload/mask exchanges remain
+    /// per console wave and continue to use `exchange_halves`.
+    fn group_wide_any(&mut self, at: usize, mine: V, group: u32) -> V {
+        let slot = self.exchange.as_ref().expect("group-wide vote needs exchange LDS").0;
+        let pair = self.exchange_pair(slot);
+        let lane = self.console_lane();
+        let five = self.s.m.i32(5);
+        let half = self.s.m.bin(at, Bin::LShr, lane, five);
+        let index = self.s.m.bin(at, Bin::Add, pair, half);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(at, lds, index);
+        self.s.m.store(at, ptr, mine);
+        self.group_sync(at);
+        let mut any = self.s.m.i32(0);
+        for i in 0..group.div_ceil(32) {
+            let index = self.s.m.i32(slot + i);
+            let ptr = self.s.m.element(at, lds, index);
+            let vote = self.s.m.load(at, ptr);
+            any = self.s.m.bin(at, Bin::Or, any, vote);
+        }
+        self.group_sync(at);
+        any
+    }
+
     /// The console's decision of the branch closing IR block `b`, which the wave takes
     /// together ([`Structured::wide`]): `when` is the lane's own bit, and the branch is taken
     /// when some lane's `when` holds (`execnz`, `vccnz`, SCC of a mask operation set) or
@@ -3689,9 +3715,17 @@ impl<'a> Lower<'a> {
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
-        let (lo, hi) = self.exchange_halves(c, some);
+        let group = match self.x.native.io {
+            StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+            _ => 64,
+        };
+        let both = if group > 64 {
+            self.group_wide_any(c, some, group)
+        } else {
+            let (lo, hi) = self.exchange_halves(c, some);
+            self.s.m.bin(c, Bin::Or, lo, hi)
+        };
         let c = self.cur;
-        let both = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
     }

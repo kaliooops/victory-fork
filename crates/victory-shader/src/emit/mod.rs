@@ -408,7 +408,7 @@ pub fn emit(
                         forms[0].1.as_ref().map(|f| &f.0),
                         Some(p),
                     ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
+                    for base in bases.into_iter().flatten() {
                         let again = widen(c, native, base, why);
                         report("wave-wide branches", &again);
                         if done(&again) {
@@ -477,7 +477,7 @@ pub fn emit(
                 forms[0].1.as_ref().map(|f| &f.0),
                 Some(p),
             ];
-            if let Some(base) = bases.into_iter().flatten().next() {
+            for base in bases.into_iter().flatten() {
                 let again = widen(c, native, base, why);
                 report("wave-wide branches (last resort)", &again);
                 if done(&again) {
@@ -492,7 +492,7 @@ pub fn emit(
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+                && (what == lower::LANE_MASK || lower::needs_every_lane(what))
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
@@ -524,9 +524,8 @@ pub fn emit(
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// it translates or a branch cannot be widened. Several console waves vote as a whole
+/// group, so the barriers inside widened regions are reached by every host wave.
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -540,7 +539,10 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs)
+            if cs.threads.iter().product::<u32>() == 64
+                || cs.threads.iter().product::<u32>().is_multiple_of(64)
+                    && std::env::var_os("VICTORY_GROUP_WIDE").is_some_and(|v| v == "1") => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -549,11 +551,16 @@ fn widen(
         }
         _ => return Err(NOT),
     }
+    // Descriptor provenance follows the title's logical lane paths. Making
+    // an EXEC skip physically uniform must not add the inactive edge's
+    // unrelated SGPR contents to a descriptor used only by active lanes.
+    // Resources carry IR sites/values, not Bools from this structurisation.
+    let semantic = structure::structure(p)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&semantic))?;
     let mut wide = std::collections::HashSet::new();
     loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
-        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
         let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
@@ -579,8 +586,82 @@ fn widen(
             }
             return r;
         }
+        if let crate::native::StageIo::Cs(cs) = native.io
+            && native.wave64 && lower::host_max_wave() == 32
+            && cs.threads.iter().product::<u32>() > 64
+            && more.iter().any(|&b| !group_wide_skip_or_loop(p, b))
+        {
+            let rejected = more.iter().copied().find(|&b| !group_wide_skip_or_loop(p, b)).expect("a rejected group branch");
+            if why {
+                for &b in more.iter().filter(|&&b| !group_wide_skip_or_loop(p, b)) {
+                    eprintln!("WAVE64-WIDE needs logical wave paths at {:#x}, last {:?}, exit {:?}", p.blocks[b].offset,
+                        p.blocks[b].insts.last().map(|i| (i.machine.offset, i.name())), p.blocks[b].exit);
+                }
+            }
+            return Err(ShaderError::Unsupported {
+                offset: p.blocks[rejected].insts.last().map_or(p.blocks[rejected].offset, |i| i.machine.offset),
+                what: "a multi-wave branch requiring per-console-wave path preservation",
+            });
+        }
         wide.extend(more);
     }
+}
+
+/// A mask branch may skip a single region or continue a masked loop. An
+/// actual if/else needs serialization of both arms before group voting is
+/// sound; leave it refused rather than silently dropping an arm's work.
+fn group_wide_skip_or_loop(p: &ir::Program, branch: usize) -> bool {
+    // A VCC/SCC decision need not clear EXEC for waves that leave a loop.
+    // A single group vote would then let them perform extra work or make
+    // another wave exit early. Until logical wave paths are preserved, only
+    // the explicit EXEC-masked subset is eligible for this experiment.
+    if !p.blocks[branch].insts.last().is_some_and(|i| matches!(i.name(), "s_cbranch_execz" | "s_cbranch_execnz")) {
+        return false;
+    }
+    let ir::Exit::Branch { taken, not_taken } = p.blocks[branch].exit else { return false };
+    if p.blocks[branch].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+        && p.blocks[taken].offset <= p.blocks[branch].offset
+    {
+        // An EXEC==0 back edge asks ALL, whereas keeping a physical group
+        // loop alive needs ANY of its logical wave continuation decisions.
+        return false;
+    }
+    let empty_end = |b: usize| p.blocks[b].exit == ir::Exit::End
+        && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }));
+    if empty_end(taken) || empty_end(not_taken) { return true; }
+    let reaches_without = |start: usize, goal: usize, stop: usize| {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut todo = vec![start];
+        while let Some(b) = todo.pop() {
+            if b == goal { return true; }
+            if b == stop || seen[b] { continue; }
+            seen[b] = true;
+            todo.extend(p.blocks[b].exit.successors());
+        }
+        false
+    };
+    let exits_without = |start: usize, stop: usize| {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut todo = vec![start];
+        while let Some(b) = todo.pop() {
+            if b == stop || seen[b] { continue; }
+            seen[b] = true;
+            if matches!(p.blocks[b].exit, ir::Exit::End | ir::Exit::Indirect) { return true; }
+            todo.extend(p.blocks[b].exit.successors());
+        }
+        false
+    };
+    // The other successor either rejoins at the skip target or loops back
+    // through the voting branch; it must not escape elsewhere.
+    [ (taken, not_taken), (not_taken, taken) ].into_iter().any(|(skip, body)| {
+        // Natural loop back edges may have inner breaks that leave through
+        // another exit. The header still dominates this voting branch.
+        let back = p.blocks[body].offset <= p.blocks[branch].offset
+            && (!reaches_without(0, branch, body) || !reaches_without(0, body, branch));
+        back ||
+        reaches_without(body, skip, branch) && !exits_without(body, skip)
+            || reaches_without(body, branch, skip) && !exits_without(body, branch)
+    })
 }
 
 /// The translated program, and the wave size it requires of the host.

@@ -1124,7 +1124,22 @@ impl<'a> Tracer<'a> {
             .ok_or("a descriptor not in SGPRs")?;
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
-        self.classify(&words, &mut Vec::new(), &mut known)
+        let result = self.classify(&words, &mut Vec::new(), &mut known);
+        if result.is_err() && std::env::var_os("VICTORY_RESOURCE_WHY").is_some() {
+            eprintln!("RESOURCE-WHY at {:#x} {op:?}: {words:?}: {result:?}", inst.machine.offset);
+            for word in &words {
+                if let Term::Value(v) = *word {
+                    if let Some(def) = self.def(v) {
+                        eprintln!("  {v:?} at {:#x} {} reads {:?}", def.machine.offset, def.name(),
+                            def.reads.iter().map(|&(r, v)| (r, self.origin(v))).collect::<Vec<_>>());
+                    }
+                    if let Some((b, i)) = self.phis[v.0 as usize] {
+                        eprintln!("  {v:?} phi block {b}: {:?}", self.p.blocks[b].phis[i]);
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks

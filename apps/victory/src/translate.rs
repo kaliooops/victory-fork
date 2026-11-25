@@ -334,6 +334,11 @@ fn translate(
     if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
         return;
     }
+    // A native validator/driver crash cannot unwind the batch's final
+    // tally. With --jobs 1 this identifies the exact in-flight container.
+    if std::env::var_os("VICTORY_TRANSLATE_PROGRESS").is_some_and(|v| v == "1") {
+        eprintln!("TRANSLATE-PROGRESS #{hash} {}", path.display());
+    }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {

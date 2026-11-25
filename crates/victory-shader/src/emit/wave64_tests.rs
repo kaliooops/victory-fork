@@ -125,6 +125,299 @@ fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Re
     })
 }
 
+/// All lanes initialize their LDS slot. Only t < s0 swaps with the other
+/// half of its console wave and adds a lane-32 read. Inactive console waves
+/// must meet every inserted barrier without writing either LDS or the UAV.
+#[test]
+fn multi_wave_groups_keep_inactive_lanes_predicated_across_lds_and_lane_reads() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("SM 6.6 hardware device");
+    for threads in [128u32, 256] {
+        let mut words = vec![
+            0x340C_0082, // v_lshlrev_b32 v6, 2, v0
+            0x4A0A_00FF,
+            100, // v_add_nc_u32 v5, 100, v0
+            0xD834_0000,
+            0x0000_0506,            // ds_write_b32 v6, v5
+            0xBF8A_0000,            // s_barrier
+            29 << 25 | 4 << 17 | 1, // v_xor_b32 v4, s1, v0
+            0x7D88_0800,            // v_cmp_gt_u32 vcc, s0, v4
+            0xBE8C_246A,            // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0000,            // s_cbranch_execz restore
+        ];
+        let skip = words.len() - 1;
+        words.extend_from_slice(&[
+            29 << 25 | 2 << 17 | 0xA0, // v_xor_b32 v2, 32, v0
+            0x3404_0482,               // v_lshlrev_b32 v2, 2, v2
+            0xD8D8_0000,
+            0x0700_0002, // ds_read_b32 v7, v2
+            0xD760_0014,
+            0x0001_4105,                      // v_readlane_b32 s20, v5, 32
+            37 << 25 | 7 << 17 | 7 << 9 | 20, // v_add_nc_u32 v7, s20, v7
+            0xD834_0000,
+            0x0000_0706, // ds_write_b32 v6, v7
+        ]);
+        words[skip] |= (words.len() - skip - 1) as u32;
+        words.extend_from_slice(&[
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0xBF8A_0000, // s_barrier
+            0xD8D8_0000,
+            0x0700_0006, // ds_read_b32 v7, v6
+            0xE070_1000,
+            0x8002_0706, // buffer_store_dword v7, v6, s[8:11], 0 offen
+        ]);
+        let mut native = native_of(&words, true, threads);
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= 2 << 15;
+        }
+        let p = ir::build(&native.code, true, native.vgprs).expect("IR");
+        let branch = p
+            .blocks
+            .iter()
+            .position(|b| {
+                b.insts
+                    .last()
+                    .is_some_and(|i| i.name() == "s_cbranch_execz")
+            })
+            .unwrap();
+        assert!(super::group_wide_skip_or_loop(&p, branch));
+        let shader = lowered(&native, &p, &HashSet::from([branch])).expect("group-wide lowering");
+        let mut validator =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+                .expect("DXIL validator");
+        validator
+            .validate(&mut shader.dxil.clone())
+            .expect("valid DXIL");
+        let (root, pso) = host.compute_pipeline(&shader).expect("WaveSize32 pipeline");
+        for (below, flip) in [
+            (0, 0),
+            (1, 0),
+            (31, 0),
+            (32, 0),
+            (33, 0),
+            (63, 0),
+            (64, 0),
+            (65, 0),
+            (127, 0),
+            (threads, 0),
+            (1, 64),
+            (33, 64),
+            (1, 128),
+            (65, 128),
+        ] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 0) {
+                    ud[u.index as usize] = below;
+                }
+                if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 1) {
+                    ud[u.index as usize] = flip;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(threads)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("multi-wave dispatch");
+            for t in 0..threads {
+                let expected = if t ^ flip < below {
+                    (t ^ 32) + 100 + (t / 64 * 64 + 132)
+                } else {
+                    t + 100
+                };
+                assert_eq!(
+                    out[0][t as usize], expected,
+                    "group={threads} active={below} thread={t}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn multi_wave_masked_loops_wait_for_the_last_console_wave() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("SM 6.6 hardware device");
+    for threads in [128u32, 256] {
+        let mut words = vec![
+            0x340C_0082, // v_lshlrev_b32 v6, 2, v0
+            0x7E0A_0300, // v_mov_b32 v5, v0: each lane starts at a different iteration
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x7D88_0A00, // v_cmp_gt_u32 vcc, s0, v5
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0000, // s_cbranch_execz restore
+        ];
+        let skip = words.len() - 1;
+        let body = words.len();
+        words.extend_from_slice(&[
+            0xD834_0000,
+            0x0000_0706, // ds_write_b32 v6, v7
+            0xD8D8_0000,
+            0x0200_0006,                       // ds_read_b32 v2, v6
+            37 << 25 | 7 << 17 | 2 << 9 | 129, // v_add_nc_u32 v7, 1, v2
+            37 << 25 | 5 << 17 | 5 << 9 | 129, // v_add_nc_u32 v5, 1, v5
+            0x7D88_0A00,                       // v_cmp_gt_u32 vcc, s0, v5
+            0x87FE_6A7E,                       // s_and_b64 exec, exec, vcc
+            0xBF89_0000,                       // s_cbranch_execnz body
+        ]);
+        let back = words.len() - 1;
+        words[back] |= ((body as i32 - back as i32 - 1) as i16 as u16) as u32;
+        words[skip] |= (words.len() - skip - 1) as u32;
+        words.extend_from_slice(&[
+            0xBEFE_040C, // restore EXEC, including the lanes that never entered
+            0xE070_1000,
+            0x8002_0706, // buffer_store_dword v7, v6, s[8:11], 0 offen
+        ]);
+        let mut native = native_of(&words, true, threads);
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= 2 << 15;
+        }
+        let p = ir::build(&native.code, true, native.vgprs).expect("IR");
+        let wide: HashSet<usize> = p
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(b, block)| matches!(block.exit, ir::Exit::Branch { .. }).then_some(b))
+            .collect();
+        assert!(wide.iter().all(|&b| super::group_wide_skip_or_loop(&p, b)));
+        let shader = lowered(&native, &p, &wide).expect("masked loop lowering");
+        let mut validator =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+                .expect("DXIL validator");
+        validator
+            .validate(&mut shader.dxil.clone())
+            .expect("valid DXIL");
+        let (root, pso) = host.compute_pipeline(&shader).expect("WaveSize32 pipeline");
+        for iterations in [0u32, 1, 2, 33, 65, 129] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 0) {
+                    ud[u.index as usize] = iterations;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(threads)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("masked loop dispatch");
+            for t in 0..threads {
+                assert_eq!(
+                    out[0][t as usize],
+                    iterations.saturating_sub(t),
+                    "group={threads} iterations={iterations} thread={t}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn group_widening_does_not_mistake_a_diamond_for_an_exec_skip() {
+    let native = native_of(
+        &[
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0002, // s_cbranch_execz else
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0xBF82_0001, // s_branch merge
+            0x7E0A_0282, // else: v_mov_b32 v5, 2
+            0xBEFE_040C, // merge: restore EXEC
+            0xE070_0000,
+            0x8002_0500, // buffer_store_dword v5, off, s[8:11], 0
+        ],
+        true,
+        128,
+    );
+    let p = ir::build(&native.code, true, native.vgprs).expect("IR");
+    let branch = p
+        .blocks
+        .iter()
+        .position(|b| matches!(b.exit, ir::Exit::Branch { .. }))
+        .unwrap();
+    assert!(
+        !super::group_wide_skip_or_loop(&p, branch),
+        "both arms need serialization, not one group vote"
+    );
+}
+
+#[test]
+fn widening_keeps_descriptor_provenance_on_logical_lane_paths() {
+    let mut words = vec![
+        0xF40C_0402,
+        0xFA00_0020, // load texture s[16:23] from table + 32
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // mask EXEC to lanes below s0
+        0xBF88_0000, // outer empty-wave exit, patched below
+        0xBE8E_247E, // s_and_saveexec_b64 s[14:15], exec
+        0xBF88_0009, // skip constant sampler and lane read when no lane is active
+        0xB000_0092, // sampler dword 0
+        0xBE81_03FF,
+        0x00C0_0000,
+        0xBE82_0BA8, // sampler dword 2: bit reverse of 40
+        0xBE83_0380,
+        0xD760_0018,
+        0x0001_4100, // v_readlane_b32 s24, v0, 32
+        0x7E04_0218, // v_mov_b32 v2, s24
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBEFE_040E, // restore the active lane mask saved in s[14:15]
+        0xF090_0108,
+        0x0004_0700, // image_sample_l v7, v[0:2], s[16:23], s[0:3]
+        0xE070_0000,
+        0x8002_0700, // store v7
+    ];
+    words[4] |= (words.len() - 5) as u32;
+    let mut native = native(&words);
+    native.layout.push(RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 8,
+        sgprs: 1,
+        base_register: 1,
+        user_data: 4,
+        slot: 1,
+    });
+    native.used.push(UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 8,
+        lower_bound: 1,
+        stride: 0,
+        dwords: 8,
+        user_data: 4,
+        slot: 1,
+    });
+    let p = ir::build(&native.code, true, native.vgprs).expect("IR");
+    let cbytes = crate::dxbc::build(&[]);
+    let c = crate::dxbc::Container::parse(&cbytes).unwrap();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let result = super::widen(&c, &native, &p, false);
+    lower::TEST_HOST_WAVE.set(was);
+    let (shader, wave) = result.expect("logical descriptor remains traceable after widening");
+    assert_eq!(wave, Some(32));
+    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref())
+        .expect("DXIL validator");
+    validator
+        .validate(&mut shader.dxil.clone())
+        .expect("valid DXIL");
+}
+
 #[test]
 fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     // thread t holds the 16-bit float with bits 0x3C00 + 37 t (1.0 and up, with odd
