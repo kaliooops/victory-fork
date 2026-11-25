@@ -62,6 +62,8 @@ pub(crate) struct HostHeap {
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
+    /// Cached slot ranges and the refresh shared by recorders of this heap.
+    pub(crate) buffer_refresh: Mutex<crate::draw::HeapBuffers>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -634,6 +636,7 @@ impl HostHeap {
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
+            buffer_refresh: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))

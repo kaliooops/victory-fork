@@ -8,6 +8,8 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -20,9 +22,17 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
-use crate::host::HostList;
+use crate::host::{HeapRefresh, HostList};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+
+/// The host copies each heap slot reads and the current frame's refresh.
+#[derive(Default)]
+pub(crate) struct HeapBuffers {
+    passes: u64,
+    ranges: HashMap<u32, (Arc<crate::shadow::Shadow>, u64, u64)>,
+    refresh: Option<Arc<HeapRefresh>>,
+}
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -1322,7 +1332,7 @@ impl State {
     /// its host slot and its memory brought up to date when `list` is
     /// submitted. Tables tell us which views a draw reads; nothing tells
     /// us which of the heap's a computed index names, so all of them are
-    /// made ready, once per list.
+    /// made ready by the first submitted list that uses this frame's scan.
     /// shortcut: the buffers are read, not written: what such a shader
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
@@ -1336,40 +1346,29 @@ impl State {
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
-        // One key per list, as textures have: no title resource is there.
-        const ONCE: usize = usize::MAX - 0x5e;
-        if !list.first_use(ONCE) {
+        if !list.first_heap_use(gpu) {
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
         if let Some(buffer) = host.strides_buffer() {
             list.keep(buffer);
         }
-        // The pass itself once per frame: per list it ran up to 51 times a
-        // frame over 81,000 views and 4,100 host copies, 18 s of every
-        // frame (2026-11-24, run 11).
-        // shortcut: what the title writes into such buffers between lists
-        // of one frame is seen a frame late.
-        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        // Serialize the scan and its publication so recorders never see a
+        // half-built plan. Scanning 81,000 views and 4,100 copies per list
+        // took up to 18 s a frame (2026-11-24, run 11).
+        let mut buffers = host.buffer_refresh.lock().unwrap_or_else(|e| e.into_inner());
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        if let Some(refresh) = &buffers.refresh
+            && refresh.frame() == frame
+        {
+            list.defer_heap_refresh(refresh.clone());
             return Some(gpu);
         }
         let started = std::time::Instant::now();
-        // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+        // Rescan even unchanged slots every 16 passes: released views may
+        // go stale without a write, and a slot written before its memory
+        // had a host copy can then be made.
+        let HeapBuffers { passes, ranges, .. } = &mut *buffers;
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
@@ -1414,52 +1413,30 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let len = len.min(shadow.left(address));
+            if len != 0 {
+                ranges.insert(index, (shadow, address, address + len));
+            }
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
+        let mut spans = HashMap::new();
         for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            let key = Arc::as_ptr(shadow);
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
-        drop(kept);
+        let copies = spans.len();
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
-        // Memory that is not write-watched is copied whole by every refresh.
-        // It was once refreshed only every 120 frames (unmapped pages read
-        // one by one cost 14 GB a frame in run 11, before they were
-        // remembered): streamed geometry then drew from stale buffers, and
-        // the garbage ended runs (the card stopped answering 14-90 frames
-        // into the opening cutscene; with every frame it ran on). The pass
-        // costs some 30 ms a frame this way.
-        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-        let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
-            if shadow.unwatched() {
-                // By the copy's number: a copy made where one let go was
-                // (`shadow::let_go_idle`) has never been refreshed.
-                let key = shadow.id() as usize;
-                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
-                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-                let every = *EVERY.get_or_init(|| {
-                    std::env::var("VICTORY_UNWATCHED_FRAMES")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1)
-                });
-                match whole.get(&key) {
-                    Some(&last) if frame < last + every => continue,
-                    _ => {
-                        whole.insert(key, frame);
-                    }
-                }
-            }
-            shadow.refresh(list, *from, to - from);
-        }
+        let ranges = spans
+            .into_values()
+            .map(|(shadow, from, to)| (shadow, from as usize, (to - from) as usize))
+            .collect();
+        let refresh = Arc::new(HeapRefresh::new(frame, ranges));
+        buffers.refresh = Some(refresh.clone());
+        drop(buffers);
+        list.defer_heap_refresh(refresh);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1471,7 +1448,7 @@ impl State {
             tracing::info!(
                 slots = slots.len(),
                 views,
-                copies = spans.len(),
+                copies,
                 mb = bytes >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"

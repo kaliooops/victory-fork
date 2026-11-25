@@ -5,8 +5,8 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -1549,6 +1549,28 @@ struct CardPlan {
     lists: Vec<(bool, Prelude)>,
 }
 
+type RefreshRange = (Arc<crate::shadow::Shadow>, usize, usize);
+
+/// The buffer ranges of a directly indexed heap, shared by every list
+/// that used the same scan. The submission lock serializes preparation;
+/// only the first list submitted with this plan per frame queues its
+/// refreshes. A list executed again in a later frame can refresh again.
+pub(crate) struct HeapRefresh {
+    frame: u64,
+    ranges: Vec<RefreshRange>,
+    submitted_frame: AtomicU64,
+}
+
+impl HeapRefresh {
+    pub(crate) fn new(frame: u64, ranges: Vec<RefreshRange>) -> Self {
+        Self { frame, ranges, submitted_frame: AtomicU64::new(u64::MAX) }
+    }
+
+    pub(crate) fn frame(&self) -> u64 {
+        self.frame
+    }
+}
+
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -1559,7 +1581,9 @@ enum Step {
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
-    Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    Refresh(RefreshRange),
+    /// Refreshes the buffers visible to a directly indexed heap.
+    HeapRefresh(Arc<HeapRefresh>),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
@@ -1569,6 +1593,27 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+}
+
+impl Step {
+    /// Ranges to consider before preparing a submission. Inspect each
+    /// still-pending heap plan once without consuming it.
+    fn refreshes(
+        &self,
+        frame: u64,
+        seen: &mut std::collections::HashSet<*const HeapRefresh>,
+    ) -> impl Iterator<Item = &RefreshRange> {
+        let (ranges, heap) = match self {
+            Self::Refresh(range) => (std::slice::from_ref(range), false),
+            Self::HeapRefresh(plan)
+                if plan.submitted_frame.load(Ordering::Relaxed) != frame && seen.insert(Arc::as_ptr(plan)) =>
+            {
+                (&plan.ranges[..], true)
+            }
+            _ => (&[][..], false),
+        };
+        ranges.iter().filter(move |(shadow, _, _)| !heap || shadow.heap_refresh_due(frame))
+    }
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1588,6 +1633,8 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Stride tables of directly indexed view heaps used by this list.
+    heap_buffers: std::collections::HashSet<u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2079,7 +2126,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(_) | Step::HeapRefresh(_) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
     }
@@ -2091,16 +2138,14 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
-    use std::sync::Arc;
+fn stale_under_flights(runs: &[&HostList], frame: u64) -> bool {
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
+            for (shadow, address, len) in step.refreshes(frame, &mut seen).filter(|(shadow, _, _)| shadow.writes_pending()) {
                 match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
                     Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
                     None => spans.push((shadow.clone(), *address, *address + *len)),
@@ -3914,6 +3959,7 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let frame = crate::frame::current();
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -3922,11 +3968,10 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let mut seen = std::collections::HashSet::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
+                    for (shadow, address, len) in step.refreshes(frame, &mut seen).filter(|(shadow, _, _)| !shadow.unwatched()) {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
                             .or_insert((*address, *address + *len));
@@ -3940,19 +3985,19 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights(runs, frame) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_under_flights(runs, frame) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, frame);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -4902,7 +4947,7 @@ impl HostList {
         if deferred.refreshed.insert(key) {
             deferred
                 .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+                .push(Step::Refresh((shadow.clone(), address, len)));
         }
     }
 
@@ -5064,6 +5109,14 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    pub(crate) fn first_heap_use(&self, strides_gpu: u64) -> bool {
+        self.deferred().heap_buffers.insert(strides_gpu)
+    }
+
+    pub(crate) fn defer_heap_refresh(&self, plan: Arc<HeapRefresh>) {
+        self.deferred().copies.push(Step::HeapRefresh(plan));
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -5085,7 +5138,7 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, frame: u64) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -5112,13 +5165,12 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
-                Step::Refresh(shadow, address, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Refreshes, 1);
-                        add(C::RefreshBytes, *len as u64);
-                    }
-                    batch.add(shadow, *address, *len);
+                Step::Refresh(range) => {
+                    batch.add(range);
+                    continue;
+                }
+                Step::HeapRefresh(plan) => {
+                    batch.add_heap(plan, frame);
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
@@ -5206,17 +5258,33 @@ struct Batch {
 }
 
 impl Batch {
-    fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+    fn add(&mut self, (shadow, address, len): &RefreshRange) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Refreshes, 1);
+            add(C::RefreshBytes, *len as u64);
+        }
         let end = address + len;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let key = Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                (r.1, r.2) = (r.1.min(*address), r.2.max(end));
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), *address, end));
+            }
+        }
+    }
+
+    fn add_heap(&mut self, plan: &HeapRefresh, frame: u64) {
+        if plan.submitted_frame.swap(frame, Ordering::Relaxed) != frame {
+            for range in &plan.ranges {
+                if range.0.take_heap_refresh(frame) {
+                    self.add(range);
+                }
             }
         }
     }
@@ -6422,8 +6490,40 @@ mod spare {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, HeapRefresh, host};
     use std::sync::Arc;
+
+    #[test]
+    fn heap_buffers_follow_submission_order() {
+        let Some(host) = host() else { return };
+        let title = Box::new([0u8; 4096]);
+        let address = title.as_ptr() as usize;
+        crate::shadow::register(address, address as u64, title.len() as u64);
+        let shadow = crate::shadow::find(address as u64, title.len() as u64);
+        crate::shadow::unregister(address, address as u64);
+        let shadow = shadow.expect("host copy for the test buffer");
+        let plan = Arc::new(HeapRefresh::new(7, vec![(shadow.clone(), address, title.len())]));
+
+        let recorded_first = host.new_list().unwrap();
+        let submitted_first = host.new_list().unwrap();
+        recorded_first.defer_heap_refresh(plan.clone());
+        submitted_first.defer_heap_refresh(plan);
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(submitted_first.deferred().copies[0].refreshes(7, &mut seen).count(), 1);
+        assert_eq!(recorded_first.deferred().copies[0].refreshes(7, &mut seen).count(), 0);
+
+        // The first recorder may be submitted later or never submitted.
+        let mut batch = Batch::default();
+        submitted_first.run_deferred(&mut batch, 7);
+        assert_eq!(batch.refreshes.len(), 1);
+        assert!(Arc::ptr_eq(&batch.refreshes[0].0, &shadow));
+        assert_eq!((batch.refreshes[0].1, batch.refreshes[0].2), (address, address + title.len()));
+        let mut next = Batch::default();
+        recorded_first.run_deferred(&mut next, 7);
+        assert!(next.refreshes.is_empty());
+        submitted_first.run_deferred(&mut next, 8);
+        assert_eq!(next.refreshes.len(), 1);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {

@@ -12,8 +12,8 @@
 //!
 //! shortcut: only the ranges draws are known to read are brought up to
 //! date (vertex and index buffer views, constant buffers in tables, root
-//! descriptors, buffer views in tables); buffers read through directly
-//! indexed heaps keep what their first use copied.
+//! descriptors and buffer views in tables). Directly indexed heaps refresh
+//! their scanned ranges on the first submission that uses them each frame.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -23,6 +23,16 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
+
+fn unwatched_frames() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_UNWATCHED_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    })
+}
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -37,6 +47,8 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// Last submitted heap refresh plus one, for throttled unwatched copies.
+    heap_refreshed: AtomicU64,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -1660,6 +1672,24 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Keep the optional throttling for expensive whole-range copies,
+    /// counting from actual submissions even if a recorded list was dropped.
+    pub(crate) fn heap_refresh_due(&self, frame: u64) -> bool {
+        let every = unwatched_frames();
+        every <= 1
+            || !self.unwatched()
+            || self.heap_refreshed.load(Ordering::Relaxed).checked_sub(1)
+                .is_none_or(|last| frame >= last.saturating_add(every))
+    }
+
+    pub(crate) fn take_heap_refresh(&self, frame: u64) -> bool {
+        let due = self.heap_refresh_due(frame);
+        if due && unwatched_frames() > 1 && self.unwatched() {
+            self.heap_refreshed.store(frame.saturating_add(1), Ordering::Relaxed);
+        }
+        due
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -1706,6 +1736,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
+            heap_refreshed: AtomicU64::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
