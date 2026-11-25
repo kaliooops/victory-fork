@@ -968,12 +968,18 @@ fn into_destination(
     };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
+    // Either way the title's own views of the pages are told afterwards
+    // (`xmem::physical_written`): this write faults into none of them.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let filled = fill(window.bytes()).map(drop);
+        drop(window);
+        super::xmem::physical_written(pages, offset, len);
+        return filled;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
+        super::xmem::physical_written(pages, offset, n);
         Ok(())
     } else {
         // Said aloud: the title never reads a request's result

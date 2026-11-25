@@ -370,6 +370,28 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// The other way: by section (its handle) and page index, the title
+    /// addresses that show the page ([`physical_written`]). Kept with
+    /// `views` in [`map`] and [`unmap`].
+    shown: HashMap<(usize, usize), Vec<usize>>,
+}
+
+impl Physical {
+    fn show(&mut self, base: usize, len: usize, slice: &Slice, on: bool) {
+        let section = slice.section.0 as usize;
+        for page in 0..len / PAGE {
+            let key = (section, slice.index + page);
+            let at = base + page * PAGE;
+            if on {
+                self.shown.entry(key).or_default().push(at);
+            } else if let Some(list) = self.shown.get_mut(&key) {
+                list.retain(|&a| a != at);
+                if list.is_empty() {
+                    self.shown.remove(&key);
+                }
+            }
+        }
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -557,6 +579,49 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     true
 }
 
+/// After a write into physical pages through a view of their own
+/// (DirectStorage page destinations: [`write_physical`], [`page_window`]):
+/// tells the GPU side about every title address that shows those pages.
+///
+/// The title's own views of the pages are guarded by the GPU side (read
+/// only, a write faults once and is noted), and a write through another
+/// view of the same pages faults nowhere: the host copies of the memory
+/// (the title's 174 MB geometry heap among them) kept what they had. The
+/// title streams geometry this way too, not textures alone, and when its
+/// interior arrived after the heap was first copied the GPU-side culling
+/// read stale bounds and left the walls and floors of the first gameplay
+/// room with no meshlets to draw (2026-11-25), in some runs only (when the
+/// copy was made before or after the data arrived).
+pub(crate) fn physical_written(pages: &[usize], offset: usize, len: usize) {
+    let Some(runs) = runs(pages, offset, len) else {
+        return;
+    };
+    let mut shown: Vec<(usize, usize)> = Vec::new();
+    {
+        let physical = physical();
+        for (slice, n) in &runs {
+            let section = slice.section.0 as usize;
+            for index in slice.index..slice.index + n {
+                if let Some(at) = physical.shown.get(&(section, index)) {
+                    shown.extend(at.iter().map(|&a| (a, PAGE)));
+                }
+            }
+        }
+    }
+    static TOLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if !shown.is_empty() && TOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        tracing::info!(
+            address = format_args!("{:#x}", shown[0].0),
+            pages = shown.len(),
+            "dstorage: physical pages written through a view of their own; the title's views of them told to the GPU side"
+        );
+    }
+    // Outside the page table's lock: the GPU side takes its own.
+    for (at, bytes) in shown {
+        victory_gpu::kernel_will_write(at, bytes);
+    }
+}
+
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
@@ -740,6 +805,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    physical.show(base, len, &slice, true);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -818,6 +884,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        physical.show(at, size, &slice, false);
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
