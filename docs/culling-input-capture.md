@@ -57,6 +57,14 @@ runs: other command lists record concurrently. Start with the small
 inputs, then use their heap offsets to restrict comparisons of the large
 heap. Keep every binary and derived report outside the repository.
 
+`tools/compare-buffer.ps1 -Good <file.bin> -Bad <file.bin>` streams the
+comparison and returns differing byte/dword counts, changed 64 KiB pages,
+and the first differing words as hex and floats. `-Offset` and `-Length`
+(multiples of four) restrict it to a heap range. Pipe its result to
+`ConvertTo-Json -Depth 5` to save a report outside the repository. It can
+also compare a GPU input with its `title-at-submit` counterpart; differing
+bytes there need interpretation of earlier GPU producers.
+
 Validation: the capture test preserves different bytes before and after a
 GPU copy in one list and checks that no file is saved before submission.
 The diagnostics GPU suite passes (118 tests, one benchmark ignored), and
