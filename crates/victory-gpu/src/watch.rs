@@ -14,11 +14,9 @@
 //! wholly uncommitted are skipped while they remain so; one query can
 //! confirm a whole region, including ordinary reservations between views.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! The runtime reports its own writes through physical-page views at all
+//! their title addresses. A write by title code through an unguarded alias
+//! can still bypass the guard on another view.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -593,6 +591,21 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// The runtime finished writing through another mapping of this range.
+/// Keep the title view protected but make the next refresh copy it again.
+pub fn title_memory_written(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    {
+        let mut g = guards();
+        for block in at / BLOCK..at.saturating_add(len).div_ceil(BLOCK) {
+            g.clean.remove(&block);
+        }
+    }
+    crate::descriptor::host::remapped(at, len);
+}
+
 /// Held shared by a read of title memory in place, and alone by the runtime
 /// while it changes what title memory shows.
 ///
@@ -817,6 +830,43 @@ mod tests {
             )
         };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn reporting_an_alias_write_dirties_only_the_written_block() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: two writable views of a fresh pagefile section.
+        let (title, writer) = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE,
+                0, (2 * BLOCK) as u32, std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let title = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK);
+            let writer = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK);
+            CloseHandle(section);
+            (title, writer)
+        };
+        assert!(!title.Value.is_null() && !writer.Value.is_null());
+        let address = title.Value as usize;
+        let take = || guard(address, address + 2 * BLOCK).unwrap();
+        assert_eq!(take(), [address / PAGE, address / PAGE + 1]);
+        // SAFETY: the second block of our separate, writable mapping.
+        unsafe { writer.Value.cast::<u8>().add(BLOCK + 17).write(0x5a) };
+        assert!(take().is_empty());
+        title_memory_written(address + BLOCK + 17, 1);
+        assert_eq!(take(), [address / PAGE + 1]);
+        assert!(take().is_empty());
+        assert!(!writable(address + BLOCK + 17));
+        title_memory_remapped(address, 2 * BLOCK);
+        // SAFETY: both mappings are still ours.
+        unsafe {
+            UnmapViewOfFile(title);
+            UnmapViewOfFile(writer);
+        }
     }
 
     #[test]

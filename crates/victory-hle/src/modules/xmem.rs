@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -370,6 +370,44 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// All title addresses of each mapped page, by section and page index.
+    aliases: BTreeSet<(usize, usize, usize)>,
+}
+
+impl Physical {
+    fn insert_view(&mut self, base: usize, len: usize, slice: Slice) {
+        let section = slice.section.0 as usize;
+        self.aliases.extend((0..len / PAGE).map(|i| (section, slice.index + i, base + i * PAGE)));
+        self.views.insert(base, (len, slice));
+    }
+
+    fn remove_view(&mut self, base: usize) -> Option<(usize, Slice)> {
+        let (len, slice) = self.views.remove(&base)?;
+        let section = slice.section.0 as usize;
+        for i in 0..len / PAGE {
+            self.aliases.remove(&(section, slice.index + i, base + i * PAGE));
+        }
+        Some((len, slice))
+    }
+
+    /// The host writes through a private view, bypassing all the title
+    /// views' protections. Report each mapped alias after the write so a
+    /// concurrent refresh cannot clear the notification before it lands.
+    fn written(&self, slice: &Slice, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = offset + len;
+        let section = slice.section.0 as usize;
+        let first = slice.index + offset / PAGE;
+        let last = slice.index + end.div_ceil(PAGE);
+        for &(_, page, address) in self.aliases.range((section, first, 0)..(section, last, 0)) {
+            let page_start = (page - slice.index) * PAGE;
+            let from = offset.max(page_start);
+            let to = end.min(page_start + PAGE);
+            victory_gpu::title_memory_written(address + (from - page_start), to - from);
+        }
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -552,6 +590,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        physical().written(slice, within, k);
         (within, done) = (0, done + k);
     }
     true
@@ -562,14 +601,25 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// would then copy.
 pub(crate) struct PageWindow {
     view: View,
+    slice: Slice,
     within: usize,
     len: usize,
+    touched: bool,
 }
 
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
+        self.touched = true;
         let (within, len) = (self.within, self.len);
         &mut self.view.bytes()[within..within + len]
+    }
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        if self.touched {
+            physical().written(&self.slice, self.within, self.len);
+        }
     }
 }
 
@@ -585,8 +635,10 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     };
     Some(PageWindow {
         view: View::map(slice, *n)?,
+        slice: slice.clone(),
         within: offset % PAGE,
         len,
+        touched: false,
     })
 }
 
@@ -740,7 +792,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
-    physical.views.insert(base, (len, slice));
+    physical.insert_view(base, len, slice);
     true
 }
 
@@ -815,7 +867,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
-        let Some((size, slice)) = physical.views.remove(&at) else {
+        let Some((size, slice)) = physical.remove_view(at) else {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
@@ -1096,6 +1148,14 @@ mod tests {
             XMemMapPhysicalPages(at(b, 1), 1, pages[2..].as_ptr()),
             at(b, 1)
         );
+        let aliases = |page| {
+            let physical = physical();
+            let slice = &physical.pages[&page];
+            let (section, index) = (slice.section.0 as usize, slice.index);
+            physical.aliases.range((section, index, 0)..(section, index + 1, 0))
+                .map(|&(_, _, address)| address).collect::<BTreeSet<_>>()
+        };
+        assert_eq!(aliases(pages[2]), BTreeSet::from([at(a, 2) as usize, at(b, 1) as usize]));
         // SAFETY: both pages are mapped read-write.
         unsafe {
             at(a, 2).cast::<u8>().write(7);
@@ -1115,6 +1175,8 @@ mod tests {
         assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(query(at(a, 2)).host.State, MEM_COMMIT);
+        assert!(aliases(pages[1]).is_empty());
+        assert_eq!(aliases(pages[2]), BTreeSet::from([at(a, 2) as usize, at(b, 1) as usize]));
         // SAFETY: still mapped.
         assert_eq!(unsafe { at(a, 2).cast::<u8>().read() }, 7);
 
