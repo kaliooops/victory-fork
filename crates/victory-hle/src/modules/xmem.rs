@@ -1168,6 +1168,7 @@ mod tests {
         unsafe { a.cast::<u8>().write(1) };
         let first = a as usize;
         let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let reader = {
             let stop = stop.clone();
             std::thread::spawn(move || {
@@ -1179,10 +1180,18 @@ mod tests {
                     // is held.
                     assert_eq!(unsafe { (first as *const u8).read_volatile() }, 1);
                     reads += 1;
+                    if reads == 1 {
+                        ready_tx.send(()).expect("the remapping thread is alive");
+                    }
                 }
                 reads
             })
         };
+        // Without a handshake, a busy host can finish all remappings and
+        // set stop before the reader is scheduled even once.
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("reader started before remapping");
         for _ in 0..2000 {
             // The same pages at the same address: the view goes and comes
             // back, with the same bytes.
