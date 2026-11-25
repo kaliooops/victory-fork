@@ -39,11 +39,17 @@ dispatch. GPU readback allocation is limited to 512 MiB per listed frame;
 omissions are warned in the log. Descriptor mismatches have a text report
 instead of a misleading snapshot from another copy.
 
-`before-title-at-submit` files contain CPU title memory during submission
-preparation. They are not GPU input snapshots: earlier GPU work may still
-produce or change those bytes. Compare them with the GPU `before` files
-with that distinction in mind. Unreadable CPU ranges are omitted and
-warned, never silently filled with zeros.
+`before-title-at-submit` files contain CPU title memory sampled after the
+submission's deferred refreshes and before execution. Their sidecars report
+byte and 64 KiB page differences against the CPU side of the bound
+shadow. For a buffer in card memory this means its staging mapping. Check
+`pending_gpu_writes` for ranges where another producer may account for
+the divergence. `different_pages_without_newer_journal_write` counts
+tracked, previously copied pages whose journal has no newer write. The
+sample does not make a fresh write-watch query, so the count alone cannot
+identify a write through an alias. Earlier GPU work can still produce
+different bytes by the time of the dispatch. Unreadable title ranges are
+omitted and warned, and unreadable shadow pages are counted separately.
 
 GPU snapshots are copies recorded at the dispatch, saved by the list's
 completion path after its fence, including with late waits. They do not

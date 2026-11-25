@@ -1647,6 +1647,8 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     #[cfg(feature = "diagnostics")]
     buffer_captures: Vec<crate::capture::buffers::Snapshot>,
+    #[cfg(feature = "diagnostics")]
+    title_samples: Vec<crate::capture::buffers::TitleSample>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -4006,6 +4008,12 @@ impl Host {
         }
         batch.flush();
         crate::watch::ask_once_end();
+        #[cfg(feature = "diagnostics")]
+        for list in runs {
+            for sample in &list.deferred().title_samples {
+                sample.save();
+            }
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -5115,6 +5123,11 @@ impl HostList {
 
     pub(crate) fn defer_heap_refresh(&self, plan: Arc<HeapRefresh>) {
         self.deferred().copies.push(Step::HeapRefresh(plan));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_title_sample(&self, sample: crate::capture::buffers::TitleSample) {
+        self.deferred().title_samples.push(sample);
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.

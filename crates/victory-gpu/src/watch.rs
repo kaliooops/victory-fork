@@ -57,6 +57,13 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
 });
 
+/// Snapshot the existing journal without asking the kernel or rearming guards.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn last_writes(first: usize, last: usize) -> Vec<(usize, u64)> {
+    let journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    journal.written.range(first..last).map(|(&page, &generation)| (page, generation)).collect()
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the

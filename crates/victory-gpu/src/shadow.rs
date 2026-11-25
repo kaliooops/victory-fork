@@ -2205,6 +2205,60 @@ impl Shadow {
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// Compare title bytes with the shadow's CPU mapping without refreshing
+    /// it. On card buffers this is the staging side, before any GPU upload.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn compare_title_sample(&self, address: usize, title: &[u8]) -> String {
+        let start = self.start as usize;
+        let end = address.saturating_add(title.len());
+        if title.is_empty() || address < start || end > start + self.len as usize {
+            return "shadow_compare=outside_shadow".to_owned();
+        }
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner())
+            .iter().any(|&(from, to)| address < to && from < end);
+        let watch = match self.watched.load(Ordering::Relaxed) {
+            1 => "tracked",
+            NOT_WATCHED => "untracked",
+            _ => "unknown",
+        };
+        let first = address / PAGE;
+        let last = end.div_ceil(PAGE);
+        let journal = crate::watch::last_writes(first, last);
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let generations = &copied[first - start / PAGE..last - start / PAGE];
+        let mut journal = journal.into_iter().peekable();
+        let mut buffer = vec![0; PAGE.min(title.len())];
+        let (mut different_bytes, mut different_pages, mut unreported_pages, mut unreadable_pages) = (0, 0, 0, 0);
+        for (page, &generation) in (first..last).zip(generations) {
+            let written = if journal.peek().is_some_and(|&(p, _)| p == page) {
+                journal.next().map_or(0, |(_, time)| time)
+            } else {
+                0
+            };
+            let from = address.max(page * PAGE);
+            let to = end.min((page + 1) * PAGE);
+            let bytes = &mut buffer[..to - from];
+            if !crate::host::read_into(self.data.wrapping_add(from - start), bytes) {
+                unreadable_pages += 1;
+                continue;
+            }
+            let expected = &title[from - address..to - address];
+            if expected != bytes {
+                different_bytes += expected.iter().zip(bytes.iter()).filter(|(a, b)| a != b).count();
+                different_pages += 1;
+                if watch == "tracked" && generation != 0 && written <= generation {
+                    unreported_pages += 1;
+                }
+            }
+        }
+        format!(
+            "shadow_compare=cpu different_bytes={different_bytes} different_pages={different_pages} \
+            different_pages_without_newer_journal_write={unreported_pages} unreadable_shadow_pages={unreadable_pages} \
+            watch={watch} pending_gpu_writes={pending} card_staging={}",
+            self.carded()
+        )
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
     /// title bytes behind: a range shaders may be writing holds a page the
     /// title wrote since the copy last took it. The answer comes from the

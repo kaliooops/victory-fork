@@ -2,7 +2,7 @@
 //! memory dumped at present, these contain the host bytes at the command.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -22,6 +22,7 @@ pub(crate) fn heap_indices() -> &'static [u32] {
 
 struct Source {
     buffer: ID3D12Resource,
+    shadow: Arc<crate::shadow::Shadow>,
     at: u64,
     bytes: u64,
     title: u64,
@@ -104,6 +105,7 @@ impl Dispatch {
         self.sources.push(Source {
             at: shadow.offset(title), buffer, bytes, title, label: label.clone(), large,
             note: format!("{} binding={label} heap={index} title={title:#x} bytes={bytes} shadow={} descriptor_matches=true", self.note, shadow.id()),
+            shadow,
         });
     }
 
@@ -138,26 +140,37 @@ impl Dispatch {
                 note.clone(),
             );
             if !after {
-                // This is CPU title memory at submission preparation, not
-                // necessarily at the GPU command (earlier GPU writes may
-                // still produce it). The label keeps that distinction clear.
-                let path = self.folder.join(format!("{stem}-title-at-submit.bin"));
-                let (title, bytes) = (source.title, source.bytes as usize);
-                list.defer_host(move || {
-                    let mut data = vec![0u8; bytes];
-                    let readable = crate::host::read_into(title as *const u8, &mut data);
-                    if readable {
-                        write(&path, &data, &format!("{note} origin=title-at-submit"));
-                    } else {
-                        tracing::warn!(
-                            title,
-                            bytes,
-                            "title buffer capture contains unreadable pages; omitted"
-                        );
-                    }
+                list.defer_title_sample(TitleSample {
+                    path: self.folder.join(format!("{stem}-title-at-submit.bin")),
+                    note,
+                    shadow: source.shadow.clone(),
+                    title: source.title as usize,
+                    bytes: source.bytes as usize,
                 });
             }
         }
+    }
+}
+
+/// A CPU sample after the submission has prepared its shadow copies.
+/// Earlier GPU commands can still change the bytes seen at the dispatch.
+pub(crate) struct TitleSample {
+    path: PathBuf,
+    note: String,
+    shadow: Arc<crate::shadow::Shadow>,
+    title: usize,
+    bytes: usize,
+}
+
+impl TitleSample {
+    pub(crate) fn save(&self) {
+        let mut data = vec![0u8; self.bytes];
+        if !crate::host::read_into(self.title as *const u8, &mut data) {
+            tracing::warn!(title = self.title, bytes = self.bytes, "title buffer capture contains unreadable pages; omitted");
+            return;
+        }
+        let comparison = self.shadow.compare_title_sample(self.title, &data);
+        write(&self.path, &data, &format!("{} origin=title-at-submit {comparison}", self.note));
     }
 }
 
@@ -295,6 +308,40 @@ pub(crate) fn write(path: &Path, bytes: &[u8], note: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn samples_compare_the_shadow_after_deferred_refreshes() {
+        let Some(host) = super::host() else { return };
+        let mut title = Box::new([0x35u8; 256]);
+        let address = title.as_ptr() as usize;
+        crate::shadow::register(address, address as u64, title.len() as u64);
+        let shadow = crate::shadow::find(address as u64, title.len() as u64);
+        crate::shadow::unregister(address, address as u64);
+        let shadow = shadow.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("title.bin");
+        let submit_sample = |refresh| {
+            let list = host.new_list().unwrap();
+            if refresh {
+                shadow.refresh(&list, address as u64, 256);
+            }
+            list.defer_title_sample(super::TitleSample {
+                path: path.clone(),
+                note: String::new(),
+                shadow: shadow.clone(),
+                title: address,
+                bytes: 256,
+            });
+            list.close();
+            host.execute(&[&list]);
+            std::fs::read_to_string(path.with_extension("txt")).unwrap()
+        };
+
+        assert!(submit_sample(true).contains("different_bytes=0 different_pages=0"));
+        title[20] = 0x79;
+        assert!(submit_sample(false).contains("different_bytes=1 different_pages=1"));
+        assert_eq!(std::fs::read(path).unwrap(), title.as_slice());
+    }
+
     #[test]
     fn snapshots_preserve_bytes_at_each_command() {
         let Some(host) = super::host() else { return };
