@@ -2461,6 +2461,26 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::listed(crate::queue::presented() + 1)
+            && let Some(host) = crate::host::host()
+        {
+            crate::capture::note_indirect_args(
+                &host.device,
+                &list.list,
+                &bounded,
+                at,
+                u64::from(stride),
+                kind,
+                // With a count buffer the record may not run at all (and
+                // the slot keeps older bytes): such lines are marked.
+                format!(
+                    "{}{}",
+                    if counter.is_some() { "(counted) " } else { "" },
+                    self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+                ),
+            );
+        }
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);

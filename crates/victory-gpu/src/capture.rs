@@ -154,6 +154,8 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
     check_trigger(frame);
+    #[cfg(feature = "diagnostics")]
+    args::flush(frame);
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -850,6 +852,133 @@ pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()
 }
+
+/// The arguments indirect commands of listed frames ran with, as clamped
+/// (diagnostics): copied on the card into a mapped ring right after each
+/// command, and written out as `frame-<n>-args.txt` at a later present, one
+/// line per command: its kind, the record's words (a mesh dispatch's three
+/// group counts, a draw's counts) and the command's note. Tells a draw the
+/// title's own culling left empty (zero groups) from one that ran.
+#[cfg(feature = "diagnostics")]
+mod args {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    const RING: u64 = 16 << 20;
+    /// Bytes copied a command: the first record, at most.
+    const MOST: u64 = 64;
+
+    struct Ring {
+        buffer: ID3D12Resource,
+        data: *const u8,
+    }
+    // SAFETY: the mapping lives as long as the buffer, which lives for the run.
+    unsafe impl Send for Ring {}
+
+    static RINGS: Mutex<Option<Ring>> = Mutex::new(None);
+    static CURSOR: AtomicU64 = AtomicU64::new(0);
+    /// (frame, ring offset, bytes, kind, note)
+    static ENTRIES: Mutex<Vec<(u64, u64, u64, u32, String)>> = Mutex::new(Vec::new());
+
+    fn ring(device: &ID3D12Device) -> Option<(ID3D12Resource, *const u8)> {
+        let mut rings = RINGS.lock().unwrap_or_else(|e| e.into_inner());
+        if rings.is_none() {
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: RING,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation into our own out pointer.
+            unsafe {
+                device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+                    .ok()?;
+            }
+            let buffer = buffer?;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a readback buffer, mapped once for the run.
+            unsafe { buffer.Map(0, None, Some(&mut data)).ok()? };
+            *rings = Some(Ring { buffer, data: data.cast() });
+        }
+        rings.as_ref().map(|r| (r.buffer.clone(), r.data))
+    }
+
+    /// Records, on `list`, the copy of `bytes` of `scratch` from `at` (in
+    /// INDIRECT_ARGUMENT, left so) for the command noted `note`.
+    pub(crate) fn note(
+        device: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        scratch: &ID3D12Resource,
+        at: u64,
+        bytes: u64,
+        kind: u32,
+        note: String,
+    ) {
+        let frame = crate::queue::presented() + 1;
+        if !super::listed(frame) {
+            return;
+        }
+        let Some((ring, _)) = ring(device) else { return };
+        let bytes = bytes.clamp(4, MOST) & !3;
+        let off = CURSOR.fetch_add(MOST, Relaxed) % RING;
+        // SAFETY: an open list; live buffers; the scratch buffer goes back
+        // to the state it was in.
+        unsafe {
+            list.ResourceBarrier(&[crate::host::transition(
+                scratch,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyBufferRegion(&ring, off, scratch, at, bytes);
+            list.ResourceBarrier(&[crate::host::transition(
+                scratch,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+        ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).push((frame, off, bytes, kind, note));
+    }
+
+    /// At the present of `frame`: the commands of earlier frames have run
+    /// (every submission is waited for without the late waits), so their
+    /// arguments are written out.
+    pub(crate) fn flush(frame: u64) {
+        let ready: Vec<_> = {
+            let mut entries = ENTRIES.lock().unwrap_or_else(|e| e.into_inner());
+            let (ready, keep) = std::mem::take(&mut *entries).into_iter().partition(|e| e.0 < frame);
+            *entries = keep;
+            ready
+        };
+        if ready.is_empty() {
+            return;
+        }
+        let Some(folder) = super::folder() else { return };
+        let data = RINGS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.data);
+        let Some(data) = data else { return };
+        let mut files: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+        for (f, off, bytes, kind, note) in ready {
+            // SAFETY: inside the mapped ring; the copy has run.
+            let words: Vec<String> = (0..bytes / 4)
+                .map(|i| unsafe { data.add((off + i * 4) as usize).cast::<u32>().read_unaligned() }.to_string())
+                .collect();
+            let text = files.entry(f).or_default();
+            text.push_str(&format!("kind {kind} args [{}] {note}\n", words.join(" ")));
+        }
+        for (f, text) in files {
+            let _ = std::fs::write(folder.join(format!("frame-{f}-args.txt")), text);
+        }
+    }
+}
+#[cfg(feature = "diagnostics")]
+pub(crate) use args::note as note_indirect_args;
 
 #[cfg(test)]
 mod tests {
