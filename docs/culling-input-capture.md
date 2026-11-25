@@ -70,3 +70,23 @@ GPU copy in one list and checks that no file is saved before submission.
 The diagnostics GPU suite passes (118 tests, one benchmark ignored), and
 diagnostics clippy passes with warnings denied. This is instrumentation,
 not a fix for the missing walls.
+
+## First runtime validation (2026-11-25)
+
+Instrumentation and comparison tool are backed up on `origin/main` in
+`ba6a4fe` and `5096d28`. A diagnostics run was launched with the settings
+above into `victory-data/cull-run-01`. Its first capture is frames
+1814-1816, during the early transition/loading sequence, **not a labeled
+good/bad prison capture**. In frame 1814, all captured static-cull small
+inputs and the complete geometry heap matched the corresponding CPU
+title-memory samples exactly. Of 60 before/title comparisons, ten differed,
+all in UAV outputs (which earlier GPU passes produce). No descriptor
+mismatch files were emitted in that frame. The comparison report is
+outside the repository at
+`victory-data/cull-analysis/run01-frame1814-title-vs-gpu.json`.
+
+This validates in-game file generation and provides no diagnosis of the
+intermittent prison bug. Another `capture-now` in the same running session
+can capture the prison once reached. Still needed: new prison captures
+with both wall outcomes, matched by output-argument buffer and pass order.
+The old captures remain the original evidence but lack raw input bytes.
