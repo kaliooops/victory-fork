@@ -46,6 +46,11 @@ if ($Fast -and -not $NoSpeed) {
     $env:VICTORY_CARD_BUFFERS_MB = '1024'
 }
 $env:NO_COLOR = '1'
+if ($env:VICTORY_SKIP_PIPELINES -and -not $Diag) {
+    # The switch is read only in diagnostics builds (`pipeline.rs`): a
+    # release run with it skips nothing, which misled two tests (2026-11-25).
+    Write-Warning 'VICTORY_SKIP_PIPELINES works only with -Diag; this release run skips nothing.'
+}
 
 $log = Join-Path (Split-Path $gameDir -Parent) 'victory-data\last-run.log'
 New-Item -ItemType Directory -Force (Split-Path $log -Parent) | Out-Null
