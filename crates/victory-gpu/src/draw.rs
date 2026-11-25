@@ -198,6 +198,8 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    #[cfg(feature = "diagnostics")]
+    buffer_capture: Option<crate::capture::buffers::Dispatch>,
 }
 
 impl Drop for State {
@@ -848,6 +850,12 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.buffer_capture = None;
+        }
+        #[cfg(feature = "diagnostics")]
+        let mut buffer_capture = None;
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -1050,11 +1058,63 @@ impl State {
                     return false;
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            if compute {
+                buffer_capture = self.capture_compute_buffers(list, stage, &made);
+            }
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        #[cfg(feature = "diagnostics")]
+        {
+            if let Some(capture) = &buffer_capture {
+                capture.record(list, false);
+            }
+            self.buffer_capture = buffer_capture;
+        }
         true
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn capture_compute_buffers(
+        &self,
+        list: &HostList,
+        stage: &crate::pipeline::host::Stage,
+        made: &[(u8, u32)],
+    ) -> Option<crate::capture::buffers::Dispatch> {
+        use crate::capture::buffers::Dispatch;
+        let mut capture = Dispatch::new(&stage.shader.hash)?;
+        for (slot, root) in self.compute.iter().enumerate() {
+            if let Root::Constants(words) = root {
+                capture.constants(list, slot, words);
+            }
+        }
+        for u in &stage.translated().used {
+            let Some(Root::Table(table)) = self.compute.get(usize::from(u.slot)) else { continue };
+            if u.root != RootType::Table { continue; }
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(heap) = self.heap_of(handle) else { continue };
+            let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else { continue };
+            let index = made.iter().find(|m| m.0 == u.slot)
+                .map_or(index, |m| m.1 / 32 + u.table_offset_dwords / 8);
+            if let Some(view) = crate::descriptor::view(handle) {
+                capture.add(host, index, &view, format!("{:?}-s{}-d{}", u.kind, u.slot, u.table_offset_dwords));
+            }
+        }
+        // Heap indices are explicit: root constants can also be ordinary
+        // integers. Guessing that every small integer is a view is misleading.
+        for index in crate::capture::buffers::heap_indices().iter().filter(|_| {
+            stage.translated().host.root_srvs.contains(&victory_shader::emit::SLOT_STRIDES)
+        }) {
+            let Some(heap) = self.heaps.iter().filter(|&&h| h != 0)
+                .map(|&h| crate::descriptor::heap(h as This)).find(|h| !h.samplers()) else { continue };
+            let Some(host) = heap.host() else { continue };
+            if let Some(view) = heap.handle(*index).and_then(crate::descriptor::view) {
+                capture.add(host, *index, &view, format!("heap-{index}"));
+            }
+        }
+        Some(capture)
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -1713,6 +1773,10 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(capture) = self.buffer_capture.take() {
+            capture.record(list, true);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2460,6 +2524,10 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH && let Some(capture) = self.buffer_capture.take() {
+            capture.record(list, true);
         }
         #[cfg(feature = "diagnostics")]
         if crate::capture::listed(crate::queue::presented() + 1)

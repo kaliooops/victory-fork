@@ -1329,6 +1329,13 @@ impl HostHeap {
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
     }
 
+    /// The resource already bound in a slot, without mirroring or refreshing
+    /// it. Diagnostics must observe stale bindings rather than repair them.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bound_buffer(&self, index: u32) -> Option<ID3D12Resource> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?.clone()
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.

@@ -1598,6 +1598,8 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    #[cfg(feature = "diagnostics")]
+    buffer_captures: Vec<crate::capture::buffers::Snapshot>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -2640,6 +2642,10 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    #[cfg(feature = "diagnostics")]
+    for capture in &list.deferred().buffer_captures {
+        capture.save();
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -4919,6 +4925,13 @@ impl HostList {
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    }
+
+    /// Diagnostic readbacks are saved only after this list's fence completes,
+    /// including with late waits, and kept alive until the list is reset.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_buffer_capture(&self, capture: crate::capture::buffers::Snapshot) {
+        self.deferred().buffer_captures.push(capture);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
