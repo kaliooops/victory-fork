@@ -47,7 +47,32 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    let triggered = TRIGGERED.load(std::sync::atomic::Ordering::Relaxed);
+    named
+        || triggered != u64::MAX && (triggered..triggered + TRIGGER_FRAMES).contains(&n)
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// The first frame captured on demand: a file named `capture-now` put in
+/// the capture folder while the title runs is taken away at the next
+/// present, and the [`TRIGGER_FRAMES`] frames from the second after it are
+/// captured as listed ones (picture, operations, and with
+/// `VICTORY_DUMP_TARGETS` every target). For a scene that cannot be
+/// reached by frame number (gameplay, after a cutscene of varying length).
+/// Again each time the file is put back.
+static TRIGGERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+const TRIGGER_FRAMES: u64 = 3;
+
+/// At the present of `frame`: whether `capture-now` asks for a capture.
+fn check_trigger(frame: u64) {
+    let Some(folder) = folder() else { return };
+    let file = folder.join("capture-now");
+    if file.exists() && std::fs::remove_file(&file).is_ok() {
+        // The next frame's lists may already be recording: from the one after.
+        let start = frame + 2;
+        TRIGGERED.store(start, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(frame = start, count = TRIGGER_FRAMES, "capture-now: frames captured from");
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -128,6 +153,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    check_trigger(frame);
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()

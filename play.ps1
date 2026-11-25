@@ -1,13 +1,16 @@
-# Starts the title with this fork's fastest known settings.
+# Starts the title.
 #
-#   .\play.ps1              release build
+#   .\play.ps1              release build, the safe settings (about 2 fps in the world)
+#   .\play.ps1 -Fast        with the speed switches (about 4 fps), which lose geometry:
+#                           the prison's walls and gate go missing (2026-11-25)
 #   .\play.ps1 -Diag        diagnostics build (frame capture, debug layer, ...)
-#   .\play.ps1 -NoSpeed     without the speed switches, as upstream runs
 #
 # The game folder comes from victory.toml (`game_dir`) or VICTORY_GAME_DIR.
 # The log goes to victory-data\last-run.log beside the game folder.
 param(
     [switch]$Diag,
+    [switch]$Fast,
+    # Kept so older notes still work: the default is already without the switches.
     [switch]$NoSpeed
 )
 $ErrorActionPreference = 'Stop'
@@ -30,9 +33,12 @@ if (-not $gameDir) { throw 'No game folder: set game_dir in victory.toml or VICT
 $title = Get-ChildItem -Path $gameDir -Filter '*.exe' | Where-Object { $_.Name -like 'game_*' } | Select-Object -First 1
 if (-not $title) { throw "No game_*.exe in $gameDir" }
 
-if (-not $NoSpeed) {
+if ($Fast -and -not $NoSpeed) {
     # Measured on an RTX 5070 in the prison scene, 2026-11-24: about 230 ms
     # a frame with these, against 450-520 ms without (docs/audit-2026-11-24.md).
+    # But with them the prison's walls and its gate are not drawn (2026-11-25:
+    # a run without them draws everything); which switch does it is not
+    # known yet.
     $env:VICTORY_RELAY = '2'
     $env:VICTORY_LATE_WAIT = '3'
     $env:VICTORY_WIDE_BACK = '1'
