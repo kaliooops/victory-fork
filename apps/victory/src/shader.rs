@@ -43,10 +43,13 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
+        .filter_map(|offset| {
+            let bytes = &data[offset..];
+            Container::parse(bytes).ok()?;
+            // parse checked the header and bounds. Hash and dump this
+            // container, not every subsequent byte of the containing file.
+            let total = u32::from_le_bytes(bytes[0x18..0x1c].try_into().ok()?) as usize;
+            Some(Source::Raw { offset, data: &bytes[..total] })
         });
     out.extend(raw);
     out
@@ -224,4 +227,29 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn embedded_container_bytes_do_not_include_the_next_container_or_trailer() {
+        let mut container = vec![0u8; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        container[0x18..0x1c].copy_from_slice(&32u32.to_le_bytes());
+        let mut packed = vec![0x11; 7];
+        packed.extend_from_slice(&container);
+        packed.extend_from_slice(&[0x22; 5]);
+        packed.extend_from_slice(&container);
+        packed.extend_from_slice(&[0x33; 19]);
+        let found = super::sources(&packed);
+        assert_eq!(found.len(), 2);
+        for source in found {
+            let bytes = source.bytes().unwrap();
+            assert_eq!(&bytes[..], &container);
+            assert_eq!(blake3::hash(&bytes), blake3::hash(&container));
+        }
+        container[0x18..0x1c].copy_from_slice(&1000u32.to_le_bytes());
+        assert!(super::sources(&container).is_empty());
+    }
 }
